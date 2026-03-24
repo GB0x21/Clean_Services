@@ -1,0 +1,22 @@
+# CleanFlow Agents — Dependencies
+# Install: pip install -r requirements.txt
+
+# Core
+supabase>=2.0.0
+openai>=1.12.0
+requests>=2.31.0
+
+# Scheduler
+APScheduler>=3.10.0
+
+# Telegram Bot (interactive with inline keyboards)
+python-telegram-bot>=21.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Utilities
+tenacity>=8.2.0    # retry logic
+
+# Optional: SMS via Twilio (uncomment if needed)
+# twilio>=9.0.0

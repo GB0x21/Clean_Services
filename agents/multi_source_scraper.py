@@ -30,6 +30,10 @@ from agents.base_agent import BaseAgent
 from config.settings import (
     config, SEARCH_PATTERNS, EXCLUDED_DOMAINS, RELEVANCE_KEYWORDS
 )
+from config.cities import (
+    CITIES, get_all_cities, get_tier1_cities, get_city_coords,
+    get_all_states, CityConfig, FREE_APIS,
+)
 
 logger = logging.getLogger("cleanflow.multi_scraper")
 
@@ -154,28 +158,22 @@ class MultiSourceScraperAgent(BaseAgent):
     # ════════════════════════════════════════════════
 
     def _scrape_google_cse(self, max_queries: int = 40) -> List[Dict]:
-        """Google Custom Search API — RFPs de todo tipo."""
+        """Google Custom Search API — RFPs de todo tipo, usando las 10 ciudades."""
         if not config.google.api_key or not config.google.cx:
             logger.info("Google CSE no configurado, saltando")
             return []
 
         leads = []
         queries_done = 0
+        cities = get_all_cities()
 
-        cities = config.criteria.tier_1_cities + config.criteria.tier_2_cities
-        city_state = {
-            "Phoenix": "AZ", "Las Vegas": "NV", "Austin": "TX",
-            "Dallas": "TX", "Houston": "TX", "Tampa": "FL",
-            "Atlanta": "GA", "Nashville": "TN",
-        }
-
-        for city in cities:
-            state = city_state.get(city, "")
-            for pattern in SEARCH_PATTERNS[:8]:  # Top 8 patterns
+        for city_cfg in cities:
+            for pattern in SEARCH_PATTERNS[:6]:  # Top 6 patterns per city
                 if queries_done >= max_queries:
                     break
 
-                query = f"{pattern} {city} {state}"
+                # Query base + keywords locales
+                query = f"{pattern} {city_cfg.name} {city_cfg.state}"
                 try:
                     resp = self.session.get(
                         "https://www.googleapis.com/customsearch/v1",
@@ -210,8 +208,8 @@ class MultiSourceScraperAgent(BaseAgent):
                             "description": snippet,
                             "source_url": url,
                             "source_platform": domain,
-                            "city": city,
-                            "state": state,
+                            "city": city_cfg.name,
+                            "state": city_cfg.state,
                         })
 
                     queries_done += 1
@@ -220,6 +218,9 @@ class MultiSourceScraperAgent(BaseAgent):
                 except Exception as e:
                     logger.error(f"Google CSE error: {e}")
                     queries_done += 1
+
+            if queries_done >= max_queries:
+                break
 
         logger.info(f"Google CSE: {len(leads)} leads ({queries_done} queries)")
         return leads
@@ -311,9 +312,8 @@ class MultiSourceScraperAgent(BaseAgent):
 
     def _scrape_google_places(self) -> List[Dict]:
         """
-        Google Places API (Nearby Search) — encuentra property management
-        companies y facilities managers que podrían necesitar limpieza.
-        Usa la misma Google API key.
+        Google Places API — encuentra property management companies,
+        facilities managers, y real estate offices en las 10 ciudades.
         """
         if not config.google.api_key:
             return []
@@ -326,24 +326,15 @@ class MultiSourceScraperAgent(BaseAgent):
             "building management company",
         ]
 
-        city_coords = {
-            "Phoenix": (33.4484, -112.0740),
-            "Las Vegas": (36.1699, -115.1398),
-            "Austin": (30.2672, -97.7431),
-            "Dallas": (32.7767, -96.7970),
-            "Houston": (29.7604, -95.3698),
-            "Tampa": (27.9506, -82.4572),
-        }
-
-        for city, (lat, lng) in city_coords.items():
-            for search_type in search_types[:2]:  # Top 2 para no agotar quota
+        for city_cfg in get_all_cities():
+            for search_type in search_types[:2]:  # Top 2 para quota
                 try:
                     resp = self.session.get(
                         "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
                         params={
                             "key": config.google.api_key,
-                            "location": f"{lat},{lng}",
-                            "radius": 30000,  # 30km
+                            "location": f"{city_cfg.lat},{city_cfg.lng}",
+                            "radius": city_cfg.search_radius,
                             "keyword": search_type,
                             "type": "establishment",
                         },
@@ -352,18 +343,18 @@ class MultiSourceScraperAgent(BaseAgent):
                     resp.raise_for_status()
                     data = resp.json()
 
-                    for place in data.get("results", [])[:5]:  # Top 5 per search
+                    for place in data.get("results", [])[:5]:
                         leads.append({
                             "title": f"Property Manager: {place.get('name', '')}",
                             "description": (
-                                f"{search_type.title()} in {city}. "
+                                f"{search_type.title()} in {city_cfg.name}. "
                                 f"Rating: {place.get('rating', 'N/A')}. "
                                 f"Address: {place.get('vicinity', '')}"
                             ),
                             "source_url": f"https://www.google.com/maps/place/?q=place_id:{place.get('place_id', '')}",
                             "source_platform": "google_places",
-                            "city": city,
-                            "state": city_coords and self._city_to_state(city),
+                            "city": city_cfg.name,
+                            "state": city_cfg.state,
                             "client_type": "property_management",
                             "client_name": place.get("name", ""),
                             "opportunity_type": "outreach_target",
@@ -372,9 +363,9 @@ class MultiSourceScraperAgent(BaseAgent):
                     time.sleep(1)
 
                 except Exception as e:
-                    logger.error(f"Google Places error: {e}")
+                    logger.error(f"Google Places error ({city_cfg.name}): {e}")
 
-        logger.info(f"Google Places: {len(leads)} property managers")
+        logger.info(f"Google Places: {len(leads)} property managers across {len(get_all_cities())} cities")
         return leads
 
     # ════════════════════════════════════════════════
@@ -383,54 +374,53 @@ class MultiSourceScraperAgent(BaseAgent):
 
     def _scrape_open_data(self) -> List[Dict]:
         """
-        Portales de datos abiertos de ciudades/estados.
-        Muchos usan Socrata API (SODA) — 100% gratis, sin API key.
+        Socrata Open Data API (SODA) — portales de datos abiertos de las 10 ciudades.
+        100% gratis, sin API key necesaria.
         """
         leads = []
 
-        # Portales Socrata conocidos con datos de procurement
-        socrata_portals = [
-            {
-                "name": "Phoenix Open Data",
-                "domain": "www.phoenixopendata.com",
-                "dataset": "procurement",
-            },
-            {
-                "name": "City of Austin",
-                "domain": "data.austintexas.gov",
-                "dataset": "procurement",
-            },
-            {
-                "name": "Harris County (Houston)",
-                "domain": "data.harriscountytx.gov",
-                "dataset": "procurement",
-            },
-        ]
+        for city_cfg in get_all_cities():
+            if not city_cfg.socrata_domain:
+                continue
 
-        for portal in socrata_portals:
-            try:
-                # Socrata SODA API — buscar contratos de limpieza
-                url = f"https://{portal['domain']}/resource/{portal['dataset']}.json"
-                params = {
-                    "$where": "lower(description) like '%cleaning%' OR lower(description) like '%janitorial%'",
-                    "$limit": 20,
-                    "$order": ":created_at DESC",
-                }
-                resp = self.session.get(url, params=params, timeout=15)
-                if resp.status_code == 200:
-                    for item in resp.json():
-                        leads.append({
-                            "title": item.get("title", item.get("description", ""))[:100],
-                            "description": item.get("description", ""),
-                            "source_url": f"https://{portal['domain']}",
-                            "source_platform": portal["name"],
-                            "client_type": "government",
-                            "opportunity_type": "open_data",
-                        })
-            except Exception as e:
-                logger.debug(f"Open data {portal['name']}: {e}")
+            for dataset in city_cfg.socrata_datasets:
+                try:
+                    url = f"https://{city_cfg.socrata_domain}/resource/{dataset}.json"
+                    params = {
+                        "$where": (
+                            "lower(description) like '%cleaning%' OR "
+                            "lower(description) like '%janitorial%' OR "
+                            "lower(description) like '%custodial%' OR "
+                            "lower(description) like '%maintenance%'"
+                        ),
+                        "$limit": 20,
+                        "$order": ":created_at DESC",
+                    }
+                    resp = self.session.get(url, params=params, timeout=15)
+                    if resp.status_code == 200:
+                        for item in resp.json():
+                            leads.append({
+                                "title": (
+                                    item.get("title", "") or
+                                    item.get("description", "") or
+                                    item.get("name", "")
+                                )[:100],
+                                "description": item.get("description", ""),
+                                "source_url": f"https://{city_cfg.socrata_domain}",
+                                "source_platform": f"opendata_{city_cfg.name.lower()}",
+                                "city": city_cfg.name,
+                                "state": city_cfg.state,
+                                "client_type": "government",
+                                "opportunity_type": "open_data",
+                            })
+                        logger.debug(
+                            f"Socrata {city_cfg.name}/{dataset}: "
+                            f"{len(resp.json())} results"
+                        )
+                except Exception as e:
+                    logger.debug(f"Open data {city_cfg.name}/{dataset}: {e}")
 
-        logger.info(f"Open Data portals: {len(leads)} leads")
+        logger.info(f"Open Data portals: {len(leads)} leads across {len([c for c in get_all_cities() if c.socrata_domain])} cities")
         return leads
 
     # ════════════════════════════════════════════════
